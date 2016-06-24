@@ -136,6 +136,9 @@ abstract class Optimizer(sessionCatalog: SessionCatalog)
     Batch("LocalRelation", fixedPoint,
       ConvertToLocalRelation,
       PropagateEmptyRelation) ::
+    Batch("Field Extraction Pushdown", fixedPoint,
+      AggregateFieldExtractionPushdown,
+      JoinFieldExtractionPushdown) ::
     Batch("OptimizeCodegen", Once,
       OptimizeCodegen) ::
     Batch("RewriteSubquery", Once,

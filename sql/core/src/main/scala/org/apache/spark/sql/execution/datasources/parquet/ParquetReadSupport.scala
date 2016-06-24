@@ -47,9 +47,20 @@ import org.apache.spark.sql.types._
  *
  * Due to this reason, we no longer rely on [[ReadContext]] to pass requested schema from [[init()]]
  * to [[prepareForRead()]], but use a private `var` for simplicity.
+ *
+ * @param parquetMrCompatibility support reading with parquet-mr or Spark's built-in Parquet reader
  */
-private[parquet] class ParquetReadSupport extends ReadSupport[UnsafeRow] with Logging {
+private[parquet] class ParquetReadSupport(parquetMrCompatibility: Boolean)
+    extends ReadSupport[UnsafeRow] with Logging {
   private var catalystRequestedSchema: StructType = _
+
+  /**
+   * Construct a [[ParquetReadSupport]] with [[parquetMrCompatibility]] set to [[false]].
+   *
+   * Spark's built-in parquet reader uses the default Java constructor, so we need a default
+   * constructor that sets [[parquetMrCompatibility]] to [[false]].
+   */
+  def this() = this(false)
 
   /**
    * Called on executor side before [[prepareForRead()]] and instantiating actual Parquet record
@@ -63,8 +74,21 @@ private[parquet] class ParquetReadSupport extends ReadSupport[UnsafeRow] with Lo
       StructType.fromString(schemaString)
     }
 
-    val parquetRequestedSchema =
+    val clippedParquetSchema =
       ParquetReadSupport.clipParquetSchema(context.getFileSchema, catalystRequestedSchema)
+
+    val parquetRequestedSchema = if (parquetMrCompatibility) {
+      // Parquet-mr will throw an exception if we try to read a superset of the file's schema.
+      // Therefore, we intersect our clipped schema with the underlying file's schema
+      ParquetReadSupport.intersectParquetGroups(clippedParquetSchema, context.getFileSchema)
+        .map(intersectionGroup =>
+          new MessageType(intersectionGroup.getName, intersectionGroup.getFields))
+        .getOrElse(ParquetSchemaConverter.EMPTY_MESSAGE)
+    } else {
+      // Spark's built-in Parquet reader will throw an exception in some cases if the requested
+      // schema is not the same as the clipped schema
+      clippedParquetSchema
+    }
 
     new ReadContext(parquetRequestedSchema, Map.empty[String, String].asJava)
   }
@@ -88,7 +112,7 @@ private[parquet] class ParquetReadSupport extends ReadSupport[UnsafeRow] with Lo
          |Parquet form:
          |$parquetRequestedSchema
          |Catalyst form:
-         |$catalystRequestedSchema
+         |${catalystRequestedSchema.prettyJson}
        """.stripMargin
     }
 
@@ -276,6 +300,27 @@ private[parquet] object ParquetReadSupport {
         .get(f.name)
         .map(clipParquetType(_, f.dataType))
         .getOrElse(toParquet.convertField(f))
+    }
+  }
+
+  /**
+   * Computes the structural intersection between two Parquet group types.
+   */
+  private def intersectParquetGroups(
+      groupType1: GroupType, groupType2: GroupType): Option[GroupType] = {
+    val fields =
+      groupType1.getFields.asScala
+        .filter(field => groupType2.containsField(field.getName))
+        .flatMap {
+          case field1: GroupType =>
+            intersectParquetGroups(field1, groupType2.getType(field1.getName).asGroupType)
+          case field1 => Some(field1)
+        }
+
+    if (fields.nonEmpty) {
+      Some(groupType1.withNewFields(fields.asJava))
+    } else {
+      None
     }
   }
 
