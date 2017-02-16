@@ -55,6 +55,7 @@ import org.apache.spark.util.{SerializableConfiguration, ThreadUtils}
 
 class ParquetFileFormat
   extends FileFormat
+  with ColumnarFileFormat
   with DataSourceRegister
   with Logging
   with Serializable {
@@ -71,6 +72,12 @@ class ParquetFileFormat
   override def hashCode(): Int = getClass.hashCode()
 
   override def equals(other: Any): Boolean = other.isInstanceOf[ParquetFileFormat]
+
+  override def columnCountForSchema(sparkSession: SparkSession, readSchema: StructType): Int = {
+    val schemaConverter = ParquetFileFormat.createSchemaConverter(sparkSession)
+    val parquetSchema = schemaConverter.convert(readSchema)
+    parquetSchema.getPaths.size
+  }
 
   override def prepareWrite(
       sparkSession: SparkSession,
@@ -418,18 +425,16 @@ class ParquetFileFormat
 }
 
 object ParquetFileFormat extends Logging {
-  private[parquet] def readSchema(
-      footers: Seq[Footer], sparkSession: SparkSession): Option[StructType] = {
-
-    def parseParquetSchema(schema: MessageType): StructType = {
-      val converter = new ParquetSchemaConverter(
+  private def createSchemaConverter(sparkSession: SparkSession): ParquetSchemaConverter =
+    new ParquetSchemaConverter(
         sparkSession.sessionState.conf.isParquetBinaryAsString,
         sparkSession.sessionState.conf.isParquetBinaryAsString,
         sparkSession.sessionState.conf.writeLegacyParquetFormat,
         sparkSession.sessionState.conf.isParquetINT64AsTimestampMillis)
 
-      converter.convert(schema)
-    }
+  private[parquet] def readSchema(
+      footers: Seq[Footer], sparkSession: SparkSession): Option[StructType] = {
+    val schemaConverter = createSchemaConverter(sparkSession)
 
     val seen = mutable.HashSet[String]()
     val finalSchemas: Seq[StructType] = footers.flatMap { footer =>
@@ -440,7 +445,7 @@ object ParquetFileFormat extends Logging {
         .get(ParquetReadSupport.SPARK_METADATA_KEY)
       if (serializedSchema.isEmpty) {
         // Falls back to Parquet schema if no Spark SQL schema found.
-        Some(parseParquetSchema(metadata.getSchema))
+        Some(schemaConverter.convert(metadata.getSchema))
       } else if (!seen.contains(serializedSchema.get)) {
         seen += serializedSchema.get
 
@@ -463,7 +468,7 @@ object ParquetFileFormat extends Logging {
           .map(_.asInstanceOf[StructType])
           .getOrElse {
             // Falls back to Parquet schema if Spark SQL schema can't be parsed.
-            parseParquetSchema(metadata.getSchema)
+            schemaConverter.convert(metadata.getSchema)
           })
       } else {
         None
