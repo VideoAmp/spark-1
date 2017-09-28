@@ -2039,4 +2039,17 @@ class DataFrameSuite extends QueryTest with SharedSQLContext {
       testData2.select(lit(7), 'a, 'b).orderBy(lit(1), lit(2), lit(3)),
       Seq(Row(7, 1, 1), Row(7, 1, 2), Row(7, 2, 1), Row(7, 2, 2), Row(7, 3, 1), Row(7, 3, 2)))
   }
+
+  test("SPARK-4502: Nested column pruning shouldn't fail filter") {
+    withTempPath { dir =>
+      val path = dir.getCanonicalPath
+      val data =
+        """{"a":{"b":1,"c":2}}
+          |{}""".stripMargin
+      Seq(data).toDF().repartition(1).write.text(path)
+      checkAnswer(
+        spark.read.json(path).filter($"a.b" > 1).select($"a.b"),
+        Seq.empty)
+    }
+  }
 }
