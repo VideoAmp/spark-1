@@ -42,21 +42,28 @@ private[sql] object ParquetSchemaPruning extends Rule[LogicalPlan] {
   private def apply0(plan: LogicalPlan): LogicalPlan =
     plan transformDown {
       case op @ PhysicalOperation(projects, filters,
-          l @ LogicalRelation(hadoopFsRelation @ HadoopFsRelation(_, partitionSchema,
+          l @ LogicalRelation(hadoopFsRelation @ HadoopFsRelation(_, _,
             dataSchema, _, parquetFormat: ParquetFileFormat, _), _, _, _)) =>
-        val projectionFields = projects.flatMap(getFields)
-        val filterFields = filters.flatMap(getFields)
-        val requestedFields = (projectionFields ++ filterFields).distinct
+        val projectionRootFields = projects.flatMap(getRootFields)
+        val filterRootFields = filters.flatMap(getRootFields)
+        val requestedRootFields = (projectionRootFields ++ filterRootFields).distinct
 
-        // If [[requestedFields]] includes a nested field, continue. Otherwise,
+        // If [[requestedRootFields]] includes a nested field, continue. Otherwise,
         // return [[op]]
-        if (requestedFields.exists { case (_, optAtt) => optAtt.isEmpty }) {
-          val prunedSchema = requestedFields
-            .map { case (field, _) => StructType(Array(field)) }
+        if (requestedRootFields.exists { case RootField(_, derivedFromAtt) => !derivedFromAtt }) {
+          // Merge the requested root fields into a single schema. Note the ordering of the fields
+          // in the resulting schema may differ from their ordering in the logical relation's
+          // original schema
+          val mergedSchema = requestedRootFields
+            .map { case RootField(field, _) => StructType(Array(field)) }
             .reduceLeft(_ merge _)
           val dataSchemaFieldNames = dataSchema.fieldNames.toSet
+          val mergedDataSchema =
+            StructType(mergedSchema.filter(f => dataSchemaFieldNames.contains(f.name)))
+          // Sort the fields of [[mergedDataSchema]] according to their order in [[dataSchema]],
+          // recursively. This makes [[mergedDataSchema]] a pruned schema of [[dataSchema]]
           val prunedDataSchema =
-            StructType(prunedSchema.filter(f => dataSchemaFieldNames.contains(f.name)))
+            sortLeftFieldsByRight(mergedDataSchema, dataSchema).asInstanceOf[StructType]
 
           // If the data schema is different from the pruned data schema, continue. Otherwise,
           // return [[op]]. We effect this comparison by counting the number of "leaf" fields in
@@ -97,20 +104,13 @@ private[sql] object ParquetSchemaPruning extends Rule[LogicalPlan] {
                 prunedRelation
               }
 
-            val nonDataPartitionColumnNames =
-              partitionSchema.map(_.name).filterNot(dataSchemaFieldNames.contains).toSet
-
             // Construct the new projections of our [[Project]] by
             // rewriting the original projections
-            val newProjects = projects.map {
-              case project if (nonDataPartitionColumnNames.contains(project.name)) => project
-              case project =>
-                (project transformDown {
-                  case projectionOverSchema(expr) => expr
-                }).asInstanceOf[NamedExpression]
-            }
+            val newProjects = projects.map(_.transformDown {
+              case projectionOverSchema(expr) => expr
+            }).map { case expr: NamedExpression => expr }
 
-            logDebug("New projects:\n" + newProjects.map(_.treeString).mkString("\n"))
+            logDebug(s"New projects:\n${newProjects.map(_.treeString).mkString("\n")}")
             logDebug(s"Pruned data schema:\n${prunedDataSchema.treeString}")
 
             Project(newProjects, projectionChild)
@@ -123,17 +123,17 @@ private[sql] object ParquetSchemaPruning extends Rule[LogicalPlan] {
     }
 
   /**
-   * Gets the top-level (no-parent) [[StructField]]s for the given [[Expression]].
-   * When [[expr]] is an [[Attribute]], construct a field around it and return the
-   * attribute as the second component of the returned tuple.
+   * Gets the root (aka top-level, no-parent) [[StructField]]s for the given [[Expression]].
+   * When [[expr]] is an [[Attribute]], construct a field around it and indicate that that
+   * field was derived from an attribute.
    */
-  private def getFields(expr: Expression): Seq[(StructField, Option[Attribute])] = {
+  private def getRootFields(expr: Expression): Seq[RootField] = {
     expr match {
       case att: Attribute =>
-        (StructField(att.name, att.dataType, att.nullable), Some(att)) :: Nil
-      case SelectedField(field) => (field, None) :: Nil
+        RootField(StructField(att.name, att.dataType, att.nullable), true) :: Nil
+      case SelectedField(field) => RootField(field, false) :: Nil
       case _ =>
-        expr.children.flatMap(getFields)
+        expr.children.flatMap(getRootFields)
     }
   }
 
@@ -151,4 +151,40 @@ private[sql] object ParquetSchemaPruning extends Rule[LogicalPlan] {
       case _ => 1
     }
   }
+
+  /**
+  *  Sorts the fields and descendant fields of structs in [[left]] according to their order in
+  *  [[right]]. This function assumes that the fields of [[left]] are a subset of the fields of
+  *  [[right]], recursively. That is, [[left]] is a "subschema" of [[right]], ignoring order of
+  *  fields.
+  */
+  private def sortLeftFieldsByRight(left: DataType, right: DataType): DataType =
+    (left, right) match {
+      case (ArrayType(leftElementType, containsNull), ArrayType(rightElementType, _)) =>
+        ArrayType(
+          sortLeftFieldsByRight(leftElementType, rightElementType),
+          containsNull)
+      case (MapType(leftKeyType, leftValueType, containsNull),
+          MapType(rightKeyType, rightValueType, _)) =>
+        MapType(
+          sortLeftFieldsByRight(leftKeyType, rightKeyType),
+          sortLeftFieldsByRight(leftValueType, rightValueType),
+          containsNull)
+      case (leftStruct: StructType, rightStruct: StructType) =>
+        val filteredRightFieldNames = rightStruct.fieldNames.filter(leftStruct.fieldNames.contains)
+        val sortedLeftFields = filteredRightFieldNames.map { fieldName =>
+          val leftFieldType = leftStruct(fieldName).dataType
+          val rightFieldType = rightStruct(fieldName).dataType
+          val sortedLeftFieldType = sortLeftFieldsByRight(leftFieldType, rightFieldType)
+          StructField(fieldName, sortedLeftFieldType)
+        }
+        StructType(sortedLeftFields)
+      case (left, _) => left
+    }
+
+  /**
+   * A "root" schema field (aka top-level, no-parent) and whether it was derived from
+   * an attribute or had a proper child.
+   */
+  private case class RootField(field: StructField, derivedFromAtt: Boolean)
 }
